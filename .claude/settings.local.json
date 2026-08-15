@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cmd /c \"dir /a G:\\\\prompt\\\\\"\"trade - compact mobile view base previous day\"\" \")"
+    ]
+  }
+}
