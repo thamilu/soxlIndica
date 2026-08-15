@@ -216,9 +216,6 @@ const int C_PERCENTILE_LEN = 500
 // Shared 5%-per-bar EWMA learning rate for the adaptive evidence factor trackers (L_index/L_basket/L_qqq/
 // L_macro/L_mom) and the directional/next-day rolling hit-rate trackers — same decay speed by design.
 const float C_EWMA_A     = 0.05
-// Shared asymmetric skew coefficient for the model volatility bands (Pre/Reg/Post/Ovn/NextDay bounds).
-// P1-21: NOT a formal statistical confidence interval — see the bounds computation sites for why.
-const float C_SKEW_COEF  = 0.35
 
 // --- Dynamic Percentile Helper ---
 f_percentileThresh(float s, float p, float fallback) =>
@@ -427,7 +424,13 @@ f_calcRollingSortino(array<float> outcomeArr, array<int> barsHeldArr, int winLen
                 downsideVarSum += math.pow(ot, 2)
                 downsideCount += 1
         float avg = sum / activeLen
-        float downsideDev = downsideCount > 1 ? math.sqrt(downsideVarSum / (downsideCount - 1)) : (downsideCount == 1 ? math.abs(sum) : 0.0)
+        // Issue #2: downsideCount==1 previously used math.abs(sum) — the NET P&L of the entire window
+        // (already computed a line above for avg), not the magnitude of the one losing trade. downsideVarSum
+        // already accumulated ot^2 for exactly that one loss, so sqrt(downsideVarSum) IS its magnitude —
+        // math.abs(sum) is an unrelated quantity that's typically large and positive in a mostly-winning
+        // window (dominated by wins), which crushed the reported Sortino toward zero for a routine, common
+        // window composition (any rolling window with exactly one loss), not an edge case.
+        float downsideDev = downsideCount > 1 ? math.sqrt(downsideVarSum / (downsideCount - 1)) : (downsideCount == 1 ? math.sqrt(downsideVarSum) : 0.0)
         float annFactor = f_annualizationFactor(barsHeldArr, winLen, totalTrades)
         float sortinoRaw = downsideDev > 0 ? (avg / downsideDev) * annFactor : (avg > 0 ? math.sqrt(activeLen) : 0.0)
         float cap = math.sqrt(activeLen) * 2.5
@@ -518,9 +521,25 @@ f_tanh(float x) =>
 // f_retProbEmpWeight previously mirroring f_retToProb's bin math, generalized into a shared function.
 // priceOverride lets a caller reconstruct a PAST forecast's raw score using the price level at forecast
 // time (e.g. frozenOrigin) instead of today's live close.
-f_rawProb(float expRet, float atrVal, float caWinRate, float priceOverride) =>
+// Issue #1: t_hours (default na — preserves exact prior behavior at any call site that doesn't pass it)
+// lets a caller horizon-scale the z-score denominator. atrVal is a single fixed-length-bar ATR reading —
+// it implicitly represents "typical range over i_atrLen bars of THIS chart's own timeframe," a FIXED
+// reference horizon in wall-clock time regardless of what forward horizon expRet actually spans. Previously
+// a 30-minute expRet and a 24-hour expRet were z-scored against the identical volScale, so tanh(zScore)
+// saturated toward +-1 far faster for long-horizon forecasts than short ones — a pure artifact of the
+// formula (not genuine extra conviction) that made Next-Day/Overnight probabilities systematically
+// overconfident relative to Pre/Post-Market ones, and inconsistent with the dashboard's own correctly
+// sqrt(t)-scaled confidence bands sitting right next to these numbers. atrRefHorizonHours reuses the same
+// bar-duration idiom already used elsewhere in this file (_tfMinsForTR/_barsPerDayTR) for "minutes
+// represented by one bar of the current chart timeframe."
+f_rawProb(float expRet, float atrVal, float caWinRate, float priceOverride, float t_hours = na) =>
     float refPrice    = na(priceOverride) ? close : priceOverride
-    float volScale    = (refPrice > 0 and atrVal > 0) ? math.max(0.3, (atrVal / refPrice) * 100.0 * 0.75) : 1.5
+    float _tfMinsForVol = timeframe.isminutes ? timeframe.multiplier : (timeframe.isdaily ? 390.0 : (timeframe.isweekly ? 1950.0 : 7800.0))
+    float atrRefHorizonHours = math.max(0.1, i_atrLen * _tfMinsForVol / 60.0)
+    float effTHours   = na(t_hours) or t_hours <= 0.0 ? atrRefHorizonHours : t_hours
+    float horizonMult = math.sqrt(effTHours / atrRefHorizonHours)
+    float volScaleBase = (refPrice > 0 and atrVal > 0) ? math.max(0.3, (atrVal / refPrice) * 100.0 * 0.75) : 1.5
+    float volScale    = volScaleBase * horizonMult
     float zScore      = nz(expRet, 0.0) / volScale
     float scaled      = f_tanh(zScore)
     float accMult     = math.max(0.60, math.min(1.40, caWinRate / 50.0))
@@ -541,8 +560,24 @@ f_rawProb(float expRet, float atrVal, float caWinRate, float priceOverride) =>
 // yet horizon-specific (one shared (a,b) fit from both resolution streams pooled, not separate short/long
 // parameters) — a natural next refinement mirroring the shortHorizonBrier/eodBrier split, not implemented
 // here to keep this change bounded.
-f_retToProb(float expRet, float atrVal, float caWinRate = 50.0, float priceOverride = na) =>
-    float clampedProb = f_rawProb(expRet, atrVal, caWinRate, priceOverride)
+// Issue #20: t_hours (default 0.0 — preserves exact prior behavior at any call site that doesn't pass it,
+// including the two out-of-sample resolution points that score shortHorizonBrier/eodBrier themselves,
+// where blending in eodWinRate would risk contaminating those metrics' own short/long separation) lets a
+// caller blend caWinRate (typically directionalWinRate, a ~30-minute-resolution EWMA hit rate) toward
+// eodWinRate (genuinely next-day-resolution) by elapsed horizon — the same hzFrac blend f_calcConf already
+// uses for its confidence STEEPNESS. Previously every "CalP" call site used directionalWinRate alone
+// regardless of horizon, so a 6H or NextDay row's calibrated probability was anchored to how well the model
+// predicts 30-minute moves. Gated on eodCount>=10 (same threshold used elsewhere for trusting eodWinRate)
+// so an unseasoned eodWinRate (starts at a neutral 50.0) can't corrupt the blend before it reflects
+// anything real.
+f_retToProb(float expRet, float atrVal, float caWinRate = 50.0, float priceOverride = na, float t_hours = 0.0) =>
+    float hzFrac = math.max(0.0, math.min(1.0, t_hours / 24.0))
+    float blendedWinRate = eodCount >= 10.0 ? caWinRate * (1.0 - hzFrac) + eodWinRate * hzFrac : caWinRate
+    // Issue #1: forward t_hours into f_rawProb's own horizon-scaling too, so every call site already
+    // updated for Issue #20's accuracy-blend also gets proper volatility scaling. t_hours<=0.0 (the
+    // protected default for the two out-of-sample resolution points that must not blend eodWinRate) maps
+    // to na here, preserving their exact prior (unscaled) volatility behavior too.
+    float clampedProb = f_rawProb(expRet, atrVal, blendedWinRate, priceOverride, t_hours > 0.0 ? t_hours : na)
     float plattX      = (clampedProb - 50.0) / 50.0
     float plattProb   = 100.0 / (1.0 + math.exp(-(plattA * plattX + plattB)))
     // Shrinkage gate — same N=40 threshold precedent as the bucket method it replaced (P0-3), but now
@@ -567,8 +602,15 @@ f_retProbEmpWeight() =>
 // Same vol-scaled tanh transform as f_retToProb, z-scored against (expected return - threshold) instead of
 // zero, so direction and tail-risk probabilities share one distributional assumption. thresholdPct > 0 asks
 // "P(return > threshold)"; < 0 asks "P(return < threshold)".
-f_probExceed(float expRet, float atrVal, float thresholdPct) =>
-    float volScale = (close > 0 and atrVal > 0) ? math.max(0.3, (atrVal / close) * 100.0 * 0.75) : 1.5
+// Issue #1: t_hours (default na) — same horizon-scaling fix as f_rawProb above, and for the same reason:
+// this shares f_rawProb's volScale formula, so it inherited the identical horizon-invariant defect.
+f_probExceed(float expRet, float atrVal, float thresholdPct, float t_hours = na) =>
+    float _tfMinsForVol2 = timeframe.isminutes ? timeframe.multiplier : (timeframe.isdaily ? 390.0 : (timeframe.isweekly ? 1950.0 : 7800.0))
+    float atrRefHorizonHours2 = math.max(0.1, i_atrLen * _tfMinsForVol2 / 60.0)
+    float effTHours2   = na(t_hours) or t_hours <= 0.0 ? atrRefHorizonHours2 : t_hours
+    float horizonMult2 = math.sqrt(effTHours2 / atrRefHorizonHours2)
+    float volScaleBase2 = (close > 0 and atrVal > 0) ? math.max(0.3, (atrVal / close) * 100.0 * 0.75) : 1.5
+    float volScale = volScaleBase2 * horizonMult2
     float z        = (nz(expRet, 0.0) - thresholdPct) / volScale
     float scaled   = f_tanh(z)
     math.max(1.0, math.min(99.0, 50.0 + scaled * 49.0))
@@ -641,6 +683,32 @@ f_isDateListed(string dateStr, string list) =>
             if array.get(parts, i) == dateStr
                 found := true
     found
+
+// Issue #2: how many calendar days from fromTs until the next genuine trading-session open (5:30 AM IST
+// Overnight open), walking forward day by day and skipping BOTH weekends AND any date listed in
+// i_holidayDates. Previously the weekend-forecast re-anchoring block only ever computed "days to next
+// Monday" from day-of-week arithmetic — correct for a genuine Sat/Sun closure, but isWeekend there is ALSO
+// set true by a single ordinary weekday holiday (isHolidayToday), which that Monday-only arithmetic then
+// mis-routed 3+ days into the future instead of to the very next trading day. capped at 10 days out as a
+// safety bound (no real market closure runs anywhere near that long).
+f_daysToNextTradingSession(int fromTs) =>
+    int y0 = year(fromTs, "Asia/Kolkata")
+    int m0 = month(fromTs, "Asia/Kolkata")
+    int d0 = dayofmonth(fromTs, "Asia/Kolkata")
+    int midnight0 = timestamp("Asia/Kolkata", y0, m0, d0, 0, 0, 0)
+    int result = 1
+    bool found = false
+    for i = 0 to 10
+        if not found
+            int candidateOpen = midnight0 + i * 86400000 + 19800000
+            if candidateOpen > fromTs
+                int dow = dayofweek(candidateOpen, "Asia/Kolkata")
+                bool isWknd = dow == dayofweek.saturday or dow == dayofweek.sunday
+                bool isHol  = f_isDateListed(f_exchDateStr(candidateOpen), i_holidayDates)
+                if not isWknd and not isHol
+                    result := i
+                    found := true
+    result
 
 f_sessClr(string s) =>
     switch s
@@ -801,16 +869,22 @@ float rsiCenter = nz(ta.sma(rsi, 100), 50.0)
 
 [diPlus, diMinus, adxVal] = ta.dmi(i_adxLen, i_adxLen)
 float adxP70   = ta.percentile_nearest_rank(adxVal, 100, 70)
-bool  adxStrong = adxVal >= adxP70
+// Issue #5: explicit na-guards on the four percentile-threshold booleans below (adxStrong/volSurge/
+// bigMove, and isExpansion/isCompression further down which read atrP90/atrP20/bbP20) — ta.percentile_
+// nearest_rank returns na until its lookback window is filled (50-100 bars), and a bare `adxVal >= atrP70`
+// against na would silently evaluate false in Pine, working "by accident" rather than by design. Guarding
+// explicitly (not na(...) and ...) documents that these can only fire once real percentile history exists,
+// matching the same not-na-guard convention already used for spyBull/qqqBull/etc. above.
+bool  adxStrong = not na(adxP70) and adxVal >= adxP70
 
 float volMA    = ta.sma(volume, i_volLen)
 float rvol     = volMA > 0 ? volume / volMA : 1.0
 float rvolP80  = ta.percentile_nearest_rank(rvol, 50, 80)
-bool  volSurge = rvol >= rvolP80
+bool  volSurge = not na(rvolP80) and rvol >= rvolP80
 
 float bodySize = math.abs(close - open)
 float bodyP85  = ta.percentile_nearest_rank(bodySize, 50, 85)
-bool  bigMove  = bodySize > bodyP85
+bool  bigMove  = not na(bodyP85) and bodySize > bodyP85
 
 float mfi      = ta.mfi(hlc3, 14)
 float mfiCenter = nz(ta.sma(mfi, 100), 50.0)
@@ -924,19 +998,31 @@ dxyClose   = request.security("TVC:DXY",   timeframe.period, close, gaps=barmerg
 spyEma   = ta.ema(spyClose, 50)
 qqqEma   = ta.ema(qqqClose, 50)
 smhEma   = ta.ema(smhClose, 50)
-vixEma   = ta.ema(vixClose, 50)
 indexEma = ta.ema(indexClose, 50)
-us10yEma = ta.ema(us10yClose, 50)
-dxyEma   = ta.ema(dxyClose, 50)
+
+// Issue #3: VIX/US10Y/DXY's "is this elevated/trending vs. its OWN baseline" read is a structural, macro
+// regime question — it should mean the same thing regardless of what chart timeframe the user has open,
+// the same way htf1Close/htf1Ema (§4 above) are deliberately anchored to a fixed higher timeframe rather
+// than inheriting timeframe.period. Previously vixEma/us10yEma/dxyEma were ta.ema(x, 50) computed on
+// timeframe.period-fetched data — 50 bars of a 1-minute chart is under an hour of VIX history, not a
+// macro baseline, while the exact same code on a daily chart is closer to 2 months; the "macro" pillar's
+// meaning silently changed with chart resolution. vix/us10y/dxyEma1D fetch a genuine 50-DAY EMA baseline
+// via the same non-repainting [1]-inside-request.security idiom already used correctly for htf1Ema
+// elsewhere in this file, compared against the still-live vixClose/us10yClose/dxyClose (unchanged, and
+// still used elsewhere for genuinely intraday-scoped reads like autoMacroSpike/vixFactor/isVixExtreme,
+// which legitimately DO want live reactivity, not a daily anchor).
+vixEma1D   = request.security("TVC:VIX",   "1D", ta.ema(close, 50)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+us10yEma1D = request.security("TVC:US10Y", "1D", ta.ema(close, 50)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+dxyEma1D   = request.security("TVC:DXY",   "1D", ta.ema(close, 50)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
 
 // Standardized neutral NA fallbacks to prevent phantom bearish/bullish bias during data loss
 bool spyBull   = not na(spyClose) and not na(spyEma) ? spyClose > spyEma : false
 bool qqqBull   = not na(qqqClose) and not na(qqqEma) ? qqqClose > qqqEma : false
 bool smhBull   = not na(smhClose) and not na(smhEma) ? smhClose > smhEma : false
 bool indexBull = not na(indexClose) and not na(indexEma) ? indexClose > indexEma : smhBull
-bool vixBear   = not na(vixClose) and not na(vixEma) ? vixClose < vixEma : false
-bool yieldBull = not na(us10yClose) and not na(us10yEma) ? us10yClose < us10yEma : false
-bool dxyBull   = not na(dxyClose)   and not na(dxyEma)   ? dxyClose   < dxyEma   : false
+bool vixBear   = not na(vixClose) and not na(vixEma1D) ? vixClose < vixEma1D : false
+bool yieldBull = not na(us10yClose) and not na(us10yEma1D) ? us10yClose < us10yEma1D : false
+bool dxyBull   = not na(dxyClose)   and not na(dxyEma1D)   ? dxyClose   < dxyEma1D   : false
 
 // Benchmark & Sector Index Returns (Priority 1: ICESEMIT 45% Weight with 4-tier availability fallback: ICESEMIT -> SMH -> QQQ -> SPY)
 float indexRetRaw = not na(indexClose) and not na(indexClose[1]) and indexClose[1] > 0 ? (indexClose - indexClose[1]) / indexClose[1] : na
@@ -1066,13 +1152,24 @@ bf3Bull := bf3 > 0
 
 // Orthogonalized Market Breadth (Fix #11: 3-Group Weighted Voting: 40% Benchmark/Indices, 30% Full Sector Basket, 30% Macro)
 float indexGroupScore = ((spyBull?1:0) + (qqqBull?1:0) + (indexBull?1:0)) / 3.0
-float assetGroupScore = basketPct / 100.0
-float macroGroupScore = ((vixBear?1:0) + (yieldBull?1:0) + (dxyBull?1:0)) / 3.0
+// Issue #1: use basketStaticPct (declared-weight, un-tilted) here, not the tactical/momentum-tilted
+// basketPct. Breadth is meant to be an independent pillar measuring genuine participation; feeding it the
+// same momentum-chasing basket that already drives fTrend/fMomentum let a narrow, few-name rally inflate
+// "breadth" in lock-step with trend/momentum instead of reflecting how broadly the group actually agreed —
+// exactly the conflation the basketStaticPct comment block above says it added a fix for, just not wired
+// in here yet.
+float assetGroupScore = basketStaticPct / 100.0
+// Macro Regime Bias (feeds both mktBreadthPct's macro pillar below AND the forecast engine's macroAdj
+// further down). Previously macroGroupScore re-derived the same three yieldBull/dxyBull/vixBear booleans
+// independently with a different weighting (1/3,1/3,1/3 here vs. 0.33/0.33/0.34 in the old macroBias),
+// so the two pipelines could silently drift out of sync over edits even though they're meant to represent
+// the same macro read. Computing macroBias once here and deriving macroGroupScore from it removes that
+// inconsistency — one macro signal now legitimately serves two distinct downstream purposes (breadth/
+// setup-quality vs. return-forecast magnitude) instead of two independently-drifting copies of itself.
+float macroBias = ((yieldBull ? 0.33 : -0.33) + (dxyBull ? 0.33 : -0.33) + (vixBear ? 0.34 : -0.34))
+float macroGroupScore = (macroBias + 1.0) / 2.0
 
 float mktBreadthPct = (indexGroupScore * 0.40 + assetGroupScore * 0.30 + macroGroupScore * 0.30) * 100.0
-
-// Macro Regime Bias (feeds into forecast engine — incorporates Yield/DXY/VIX regime)
-float macroBias = ((yieldBull ? 0.33 : -0.33) + (dxyBull ? 0.33 : -0.33) + (vixBear ? 0.34 : -0.34))
 float dADX = not na(adxVal) ? adxVal : 20.0
 // Macro weight provides directional guidance during low ADX chop/consolidation, while technical trends dominate high ADX expansion
 float dynMacroWeight = (1.0 - math.min(0.6, dADX / 50.0)) * (i_macroWeight / 100.0)
@@ -1087,8 +1184,9 @@ float bbDev   = ta.stdev(close, 20) * 2.0
 float bbWidth = close > 0 ? bbDev / close * 100.0 : 0.0
 float bbP20   = ta.percentile_nearest_rank(bbWidth, 50, 20)
 
-bool isExpansion   = atr > atrP90 and volSurge
-bool isCompression = atr < atrP20 and bbWidth <= bbP20
+// Issue #5: same explicit na-guards as adxStrong/volSurge/bigMove above.
+bool isExpansion   = not na(atrP90) and atr > atrP90 and volSurge
+bool isCompression = not na(atrP20) and not na(bbP20) and atr < atrP20 and bbWidth <= bbP20
 bool isTrending    = adxStrong and (bullStack or bearStack) and not isExpansion
 bool isRanging     = not isTrending and not isExpansion and not isCompression
 
@@ -1100,6 +1198,19 @@ bool isPullback    = isTrending and (bullStack ? close < emaF : close > emaF)
 bool isAccumDist   = isRanging and adxStrong
 
 var string regime = "Mean Reversion"
+// P0 (Issue #11): regime was declared but never assigned — isMarkup/isMarkdown/isVolExp/isVolContr/
+// isPullback/isAccumDist above were computed and then discarded, silently disabling 5 of the 6
+// trendWeight branches below (§9) which permanently ran at trendWeight=0.3. isPullback is checked ahead
+// of isMarkup/isMarkdown since both can be true together (isTrending & bullStack & close<emaF) and a
+// pullback within a trend should get the lower Pullback trendWeight (0.7), not the full Markup/Markdown
+// weight (0.95).
+regime := isPullback ? "Pullback" :
+     isMarkup    ? "Trend (Markup)" :
+     isMarkdown  ? "Trend (Markdown)" :
+     isVolExp    ? "Volatility Expansion" :
+     isVolContr  ? "Volatility Contraction" :
+     isAccumDist ? "Accumulation/Distribution" :
+     "Mean Reversion"
 
 // ════════════════════════════════════════════════════════════════════════
 // §6  MARKET STRUCTURE ENGINE
@@ -1147,11 +1258,17 @@ bool bearBOS = confirmed and not na(lastSL) and close < lastSL and close[1] >= l
 bool minorBullBOS = confirmed and not na(lastIntSH) and close > lastIntSH and close[1] <= lastIntSH
 bool minorBearBOS = confirmed and not na(lastIntSL) and close < lastIntSL and close[1] >= lastIntSL
 
+// Issue #10: snapshot msState once before either branch mutates it. bullBOS/bearBOS are each gated on
+// opposite conditions (close > lastSH vs close < lastSL) so both firing the same bar is a degenerate edge
+// case (e.g. lastSH < lastSL after a swing update), but the old two-independent-if-blocks version let the
+// second block silently overwrite prevMsState with the first block's already-updated msState instead of
+// the true pre-bar state, corrupting CHoCH detection on that bar.
+int priorMsState = msState
 if bullBOS
-    prevMsState := msState
+    prevMsState := priorMsState
     msState     := 1
 if bearBOS
-    prevMsState := msState
+    prevMsState := priorMsState
     msState     := -1
 
 bool bullCHoCH = bullBOS and prevMsState == -1
@@ -1225,9 +1342,19 @@ if confirmed
     else if bearMomLost
         effectiveTrend := 1
 
-// ── Fix 5: Faster Structural Trend Recovery (gated by confirmed bar) ──
-bool bearRecovery = effectiveTrend == -1 and close > emaF and rsi > 55.0 and rvol > 1.5 and close > close[1]
-bool bullRecovery = effectiveTrend == 1 and close < emaF and rsi < 45.0 and rvol > 1.5 and close < close[1]
+// Issue #9: hysteresis — track how many confirmed bars effectiveTrend has held its current value so
+// Layer 3/recovery can't flip-flatten-reflip a trend that only just formed one bar ago. effectiveTrend[1]
+// is safe here: Layers 1-3 above only ever mutate effectiveTrend when `confirmed` is true (bullBOS,
+// minorBullBOS, bullSweep etc. are all confirmed-gated in their own definitions), so effectiveTrend[1]
+// always reflects the prior confirmed bar's final value regardless of intrabar reads this bar.
+var int trendStableBars = 0
+if confirmed
+    trendStableBars := effectiveTrend != effectiveTrend[1] ? 0 : trendStableBars + 1
+int minTrendAgeForRecovery = 2
+
+// ── Fix 5: Faster Structural Trend Recovery (gated by confirmed bar + minimum trend age) ──
+bool bearRecovery = effectiveTrend == -1 and close > emaF and rsi > 55.0 and rvol > 1.5 and close > close[1] and trendStableBars >= minTrendAgeForRecovery
+bool bullRecovery = effectiveTrend == 1 and close < emaF and rsi < 45.0 and rvol > 1.5 and close < close[1] and trendStableBars >= minTrendAgeForRecovery
 if confirmed
     if bearRecovery
         effectiveTrend := 0
@@ -1535,7 +1662,12 @@ float sBreadth = mktBreadthPct
 float fRelStrength = sBreadth / 100.0
 
 // 5. Execution / Volatility Factor (0-100) — Fix Issue #9: Active integration of fVolatility
-float fVolatility = (adrOK ? 0.3 : 0.0) + (adxStrong ? 0.4 : 0.0) + (not isExpansion ? 0.3 : 0.0)
+// Issue #3: adrOK used to appear both here (weight 0.3 of fVolatility's own 0-1 range) AND directly in
+// fExec (weight 0.25), giving it an effective ~0.31 total weight instead of the intended 0.25. adrOK is
+// dropped from fVolatility and the remaining adxStrong/notExpansion weights (originally 0.4/0.3 out of a
+// 1.0 max) are rescaled by 1/0.7 so fVolatility still maxes at 1.0 and fExec's total still maxes at 1.0,
+// with adrOK counted exactly once via its direct 0.25 term below.
+float fVolatility = (adxStrong ? 4.0 / 7.0 : 0.0) + (not isExpansion ? 3.0 / 7.0 : 0.0)
 float fExec = (inKillZone ? 0.35 : 0.0) + (adrOK ? 0.25 : 0.0) + ((rsi >= 30.0 and rsi <= 75.0) ? 0.20 : 0.0) + fVolatility * 0.20
 float sExec = fExec * 100.0
 
@@ -1698,6 +1830,11 @@ float corrST     = ta.correlation(T_ST[1],       realizedBarRet, i_rollWin)
 float corr1H     = ta.correlation(T_1H[1],       realizedBarRet, i_rollWin)
 float corr4H     = ta.correlation(T_4H[1],       realizedBarRet, i_rollWin)
 float corr1D     = ta.correlation(T_1D[1],       realizedBarRet, i_rollWin)
+// Issue #4: macro's own lagged correlation, added for parity with index/basket/QQQ/momentum below — all
+// four of those gate their evidence weight on both hit-rate (L_*) AND correlation reliability
+// (corrReliability*); macro previously used hit-rate only, so it could stay elevated even with zero
+// measured correlation to realized returns.
+float corrMacro  = ta.correlation(macroBias[1],    realizedBarRet, i_rollWin)
 
 int smoothLen   = math.max(20, i_rollWin)
 float sCorrIndex  = ta.ema(math.max(0.0, nz(corrIndex, 0.45)), smoothLen)
@@ -1707,6 +1844,7 @@ float sCorrST     = ta.ema(math.max(0.0, nz(corrST, 0.10)), smoothLen)
 float sCorr1H     = ta.ema(math.max(0.0, nz(corr1H, 0.10)), smoothLen)
 float sCorr4H     = ta.ema(math.max(0.0, nz(corr4H, 0.10)), smoothLen)
 float sCorr1D     = ta.ema(math.max(0.0, nz(corr1D, 0.10)), smoothLen)
+float sCorrMacro  = ta.ema(math.max(0.0, nz(corrMacro, 0.20)), smoothLen)
 
 // ─── Priority 13: Adaptive Evidence Weighting Engine (online mixture-of-factors, NOT Bayesian) ───
 // This is a directional-hit-rate-weighted evidence blend: L_index etc. are EWMA hit-rate trackers, not
@@ -1763,10 +1901,11 @@ float corrReliabilityIndex  = math.max(0.0, math.min(1.0, sCorrIndex))
 float corrReliabilityBasket = math.max(0.0, math.min(1.0, sCorrBasket))
 float corrReliabilityQQQ    = math.max(0.0, math.min(1.0, sCorrQQQ))
 float corrReliabilityST     = math.max(0.0, math.min(1.0, sCorrST))
+float corrReliabilityMacro  = math.max(0.0, math.min(1.0, sCorrMacro))
 float postIndex  = L_index  * priorIndex  * corrReliabilityIndex
 float postBasket = L_basket * priorBasket * corrReliabilityBasket
 float postQQQ    = L_qqq    * priorQQQ    * corrReliabilityQQQ
-float postMacro  = L_macro  * priorMacro
+float postMacro  = L_macro  * priorMacro  * corrReliabilityMacro
 float postMom    = L_mom    * priorMom    * corrReliabilityST
 float postTotal  = postIndex + postBasket + postQQQ + postMacro + postMom
 
@@ -2021,7 +2160,12 @@ float volDragPerBar  = -0.5 * leverageFactor * (leverageFactor - 1.0) * ewmaVar 
 // ismonthly/isminutes, so 1/barsPerYear IS the correct "fraction of a trading year this one bar represents"
 // for any timeframe — reusing it makes this correct everywhere instead of only on minute charts.
 float expenseDragPerBar = -(i_expenseRatio / 100.0) * close / math.max(1.0, barsPerYear)
-float volDragPerHour = (volDragPerBar + expenseDragPerBar) * (minsPerDay / math.max(1.0, timeframe.multiplier)) / 6.5
+// Issue #5: (minsPerDay / timeframe.multiplier) is only "bars per day" on a minutes chart — on daily/
+// weekly/monthly charts timeframe.multiplier means days/weeks/months, not minutes, so this silently
+// computed a nonsensical bars-per-day (e.g. 390/1 on Daily) exactly like the bug already fixed for
+// trackingResidualPerBar above. Reusing _barsPerDayTR (which correctly branches on isminutes/isdaily/
+// isweekly/ismonthly) fixes it here too instead of re-deriving it incorrectly.
+float volDragPerHour = (volDragPerBar + expenseDragPerBar) * (_barsPerDayTR / 6.5)
 
 // P0-6: Synthetic daily-reset NAV validator. volDragPerBar's -0.5*L*(L-1)*sigma^2 term is the correct
 // closed-form (Ito) approximation of ONE reset cycle's expected drag — not wrong, but a continuous-time
@@ -2122,9 +2266,16 @@ if rsi > rsiOverbought
 else if rsi < rsiOversold
     rsiExhaust := (rsiOversold - rsi) / math.max(1.0, rsiOversold)
 rsiExhaust := math.max(-1.0, math.min(1.0, rsiExhaust))
-float vixFactor = not na(vixClose) ? (vixClose > 25.0 ? 0.60 : (vixClose > 18.0 ? 0.80 : 1.0)) : 1.0
+// Issue #12: linear ramp between the same anchor points (18→1.0, 25→0.60) instead of a hard step, so a
+// VIX print of 17.99 vs 18.01 no longer flips the output more than the underlying data actually changed.
+// Clamped to [0.60, 1.0] so the endpoints and everything beyond them match the original step values exactly.
+float vixFactor = not na(vixClose) ? math.max(0.60, math.min(1.0, 1.0 - (vixClose - 18.0) / 7.0 * 0.40)) : 1.0
 float adrDir = csBias != 0.0 ? (csBias > 0.0 ? 1.0 : -1.0) : (close >= open ? 1.0 : -1.0)
-float adrExhaustMag = adrConsumedPct > 80.0 ? 0.3 : (adrConsumedPct > 60.0 ? 0.1 : 0.0)
+// Issue #12: two summed clamped ramps (40→60 and 60→80) reproduce the original anchor values exactly at
+// 60 (0.1) and 80 (0.3, also the ceiling for anything beyond) while eliminating the two step discontinuities.
+float adrRamp1 = math.max(0.0, math.min(0.1, (adrConsumedPct - 40.0) / 20.0 * 0.1))
+float adrRamp2 = math.max(0.0, math.min(0.2, (adrConsumedPct - 60.0) / 20.0 * 0.2))
+float adrExhaustMag = adrRamp1 + adrRamp2
 float adrExhaust = -adrDir * adrExhaustMag
 
 // ═══ SESSION-SPECIFIC COMPOSITE BIASES ═══
@@ -2160,7 +2311,13 @@ int t30m_bar_ts    = time + 1800000
 string s30m_bar_st = f_getSessionIST(t30m_bar_ts)
 float tod_30m_bar  = f_todVolMult(t30m_bar_ts)
 float sv_30m_bar   = hrlyVol * tod_30m_bar * volClusterMult
-float step_30m_bar = sv_30m_bar * 0.7071 * (f_sessEffBias(s30m_bar_st, bias30m) + (macroAdj * 0.3) + attractorPull) + volDragPerHour * 0.5 + (forecastDrift * 0.85)
+// Issue #16: the bias/drift term is multiplied by 0.5 (the linear 30-minute time fraction), not 0.7071
+// (=sqrt(0.5)). sv_30m_bar is a $/hour rate; a deterministic directional conviction (bias) should scale
+// linearly with elapsed time like any drift term (mu*dt), not with sqrt(dt) — sqrt scaling is the
+// convention for a volatility/uncertainty band (already handled separately via upperSigma/lowerSigma in
+// the render layer), not for a point-forecast's expected move. Using 0.5 here also matches the linear 0.5
+// already used for volDragPerHour on this same line, which was always correctly linear.
+float step_30m_bar = sv_30m_bar * 0.5 * (f_sessEffBias(s30m_bar_st, bias30m) + (macroAdj * 0.3) + attractorPull) + volDragPerHour * 0.5 + (forecastDrift * 0.85)
 var float spx_30m_bar = na
 spx_30m_bar := P0 + step_30m_bar
 
@@ -2187,7 +2344,9 @@ int t4H_bar_ts    = time + 14400000
 string s4H_bar_st = f_getSessionIST(t4H_bar_ts)
 float tod_4H_bar  = f_todVolMult(t4H_bar_ts)
 float sv_4H_bar   = hrlyVol * tod_4H_bar * volClusterMult
-float step_4H_bar = sv_4H_bar * 2.0 * (f_sessEffBias(s4H_bar_st, bias4H) + (macroAdj * 0.3) + attractorPull) + volDragPerHour * 4.0 + (forecastDrift * 0.37)
+// Issue #16: 4.0 (linear cumulative hours), not 2.0 (=sqrt(4.0)) — same rationale as step_30m_bar above,
+// and matches the already-linear volDragPerHour * 4.0 on this same line.
+float step_4H_bar = sv_4H_bar * 4.0 * (f_sessEffBias(s4H_bar_st, bias4H) + (macroAdj * 0.3) + attractorPull) + volDragPerHour * 4.0 + (forecastDrift * 0.37)
 float spx_4H_indep = P0 + step_4H_bar
 
 // ─── Priority 3 & 11: Self-Correcting Forecast Error & Model Health Engine ───
@@ -2232,6 +2391,11 @@ float priorProbUp1Bar = bar_index > barsFor30m and not na(spx_30m_bar[barsFor30m
 // P0: raw (pre-Platt) version of the same forecast, via the shared f_rawProb helper, for the online
 // Platt-scaling SGD step right below — see f_retToProb's comment for the full rationale. Same guard as
 // priorProbUp1Bar so both fall back to the same neutral 50.0 under identical conditions.
+// Issue #1: deliberately left at f_rawProb's default (unscaled) here, NOT passed t_hours=0.5 — priorProbUp1Bar
+// just above (its calibrated counterpart, scored into shortHorizonBrier) goes through f_retToProb at its
+// own protected t_hours=0.0 default, which stays unscaled by design. Scaling only this raw side would
+// silently diverge the two from each other, contradicting the "can't drift out of sync" property this
+// shared-helper design relies on.
 float priorRawProbUp1Bar = bar_index > barsFor30m and not na(spx_30m_bar[barsFor30m]) and close[barsFor30m] > 0 ? f_rawProb((spx_30m_bar[barsFor30m] - close[barsFor30m]) / close[barsFor30m] * 100.0, nz(atr[barsFor30m], atr), nz(directionalWinRate[barsFor30m], 50.0), close[barsFor30m]) : 50.0
 if confirmed and bar_index > barsFor30m
     shortBrierCount := shortBrierCount + 1.0
@@ -2384,19 +2548,18 @@ f_renderForecastRow(table tbl, int rowIdx, string sess, float spx, float basePx,
     color clr      = isClosed ? #616161 : (isUp ? #00E676 : (isDn ? #FF1744 : #9E9E9E))
     string lbl     = "+" + hourStr + " " + tl
 
-    // Dynamic Asymmetric Model Volatility Band (Fix Issue #10: Horizon-Matched Skew). P1-21: this is NOT a
-    // rigorous statistical "68% confidence interval" despite being sized off one sigma of modeled vol —
-    // once C_SKEW_COEF asymmetrically widens/narrows the upper vs. lower bound based on the model's own
-    // directional bias, the two sides no longer correspond to a real 68%-coverage probability interval
-    // (a true CI's coverage comes from the outcome DISTRIBUTION, not from how confident the model feels).
-    // Correct description: a bias-shaped volatility band, sized from realized/clustered vol — useful as a
-    // plausible-range display, not as a calibrated "68% chance the price lands in this range" claim.
-    // Skews upside/downside width based on direction of macro trend bias FOR THIS HORIZON
-    float skewFactor = 1.0 + C_SKEW_COEF * math.max(-1.0, math.min(1.0, hBias))
-    float upperSigma = hrlyVol * math.sqrt(cumHours) * volClusterMult * skewFactor
-    float lowerSigma = hrlyVol * math.sqrt(cumHours) * volClusterMult / skewFactor
-    float rHigh      = spx + upperSigma
-    float rLow       = math.max(0.01, spx - lowerSigma)
+    // Issue #3: band made SYMMETRIC around spx — spx is already shifted in the bias direction upstream
+    // (hBias/macroContrib/attractorPull already moved the point forecast that produced spx), so the old
+    // skewFactor = 1+C_SKEW_COEF*hBias applied here spent the SAME bias signal a second time: once on
+    // location (the point forecast), again on shape (asymmetrically narrowing the "wrong" side and
+    // widening the "right" side of the band around that already-shifted point). That's the same signal
+    // counted twice, mechanically producing a band that looks more one-sided/confident than the data
+    // justifies — exactly the overconfidence failure mode this institutional review flagged. A symmetric
+    // sigma band around the already-bias-shifted point forecast captures the same directional view once,
+    // not twice. Still a modeled-vol band, not a calibrated 68% CI (per the P1-21 note this replaces).
+    float sigma = hrlyVol * math.sqrt(cumHours) * volClusterMult
+    float rHigh = spx + sigma
+    float rLow  = math.max(0.01, spx - sigma)
 
     string pctStr  = (cumRet >= 0 ? "+" : "") + str.tostring(cumRet, "#.02") + "%"
     // Directional probability for THIS horizon (was previously only shown for Pre/Reg/Post/Ovn/NextDay rows,
@@ -2407,9 +2570,12 @@ f_renderForecastRow(table tbl, int rowIdx, string sess, float spx, float basePx,
     // this comment. Spelling out "Conf"/"CalP" (still compact enough for the mobile table cells — see the
     // "kept as short as possible" note on the mobile forecast row further down) keeps that distinction
     // visible in the dashboard itself, not just in code comments nobody reading the chart sees.
-    float probUp   = f_retToProb(cumRet, atr, directionalWinRate)
+    float probUp   = f_retToProb(cumRet, atr, directionalWinRate, na, cumHours)
     string probStr = math.abs(cumRet) < 0.10 ? "50%↔" : (cumRet >= 0 ? str.tostring(probUp, "#.0") + "%↑" : str.tostring(100.0 - probUp, "#.0") + "%↓")
-    string txt     = isClosed ? "Closed" : (dIcon + "$" + str.tostring(spx, "#.02") + " (" + pctStr + ") [Conf" + str.tostring(sconf, "0") + "% CalP" + probStr + "] $" + str.tostring(rLow, "#.01") + "-" + str.tostring(rHigh, "#.01") + suffix)
+    // Issue #28: "~$" (not "$") prefixes the range — a compact, mobile-cell-sized signal that this is the
+    // bias-shaped volatility band described above (P1-21), not a calibrated confidence interval, so the
+    // caveat travels with the number on the dashboard itself, not only in source comments.
+    string txt     = isClosed ? "Closed" : (dIcon + "$" + str.tostring(spx, "#.02") + " (" + pctStr + ") [Conf" + str.tostring(sconf, "0") + "% CalP" + probStr + "] ~$" + str.tostring(rLow, "#.01") + "-" + str.tostring(rHigh, "#.01") + suffix)
     f_dashCell(tbl, rowIdx, lbl, txt, f_sessClr(sess), clr, bg, size.tiny)
 
 // Renders the 30m-6H hourly forecast ladder only. The EOD/Next-Day summary is rendered once by the
@@ -2448,14 +2614,18 @@ f_renderForecastBlock(table tbl, int startRow, string s30, string s45, string s1
     r
 
 // ─── Timestamps for time-of-day volatility distributions ───
-int t30m_step = timenow + 1800000
-int t45m_step = timenow + 2700000
-int t1H_step  = timenow + 3600000
-int t2H_step  = timenow + 7200000
-int t3H_step  = timenow + 10800000
-int t4H_step  = timenow + 14400000
-int t5H_step  = timenow + 18000000
-int t6H_step  = timenow + 21600000
+// Issue #17: `time` (this bar's own timestamp), not `timenow` (script execution wall-clock time, constant
+// across every historical bar) — same rationale already documented and fixed for nowMins/nowSess below.
+// Using timenow here meant every historical bar's session/time-of-day classification for this ladder was
+// computed off today's real clock instead of that bar's own time.
+int t30m_step = time + 1800000
+int t45m_step = time + 2700000
+int t1H_step  = time + 3600000
+int t2H_step  = time + 7200000
+int t3H_step  = time + 10800000
+int t4H_step  = time + 14400000
+int t5H_step  = time + 18000000
+int t6H_step  = time + 21600000
 
 string s30m_st = f_getSessionIST(t30m_step)
 string s45m_st = f_getSessionIST(t45m_step)
@@ -2481,21 +2651,30 @@ float smoothModelHealth = ta.ema(modelHealthScore, 20)
 float macroContrib = macroAdj * math.max(0.35, math.min(1.0, smoothModelHealth / 100.0))
 
 // Step 1: +30m
+// Issue #16: the bias/macro/attractor drift term below is now scaled by the LINEAR elapsed-time fraction
+// of each increment (0.5, 0.25, 0.25 — identical to the multiplier already correctly used for
+// volDragPerHour on the same lines), not by sqrt(dt) (0.7071, 0.50, 0.50 previously). A deterministic
+// directional conviction is a drift term (mu*dt, linear in time); sqrt(dt) is the volatility/uncertainty
+// scaling convention (still used correctly elsewhere for upperSigma/lowerSigma). Chaining sqrt(dt)-scaled
+// increments made the ladder's cumulative expected move depend on how finely the horizon was chopped into
+// steps (sum of sqrt(dt_i) over a partition grows with the number of steps, unlike a fixed total drift),
+// which has no statistical basis. 2H-6H below are unaffected since their dt=1.0 exactly, where sqrt(dt)
+// and dt coincide.
 float tod_30m  = f_todVolMult(t30m_step)
 float sv_30m   = hrlyVol * tod_30m * volClusterMult
-float step_30m = sv_30m * 0.7071 * (f_sessEffBias(s30m_st, bias30m) + macroContrib * 0.5 + attractorPull) + volDragPerHour * 0.5 + dStep1
+float step_30m = sv_30m * 0.5 * (f_sessEffBias(s30m_st, bias30m) + macroContrib * 0.5 + attractorPull) + volDragPerHour * 0.5 + dStep1
 spx_30m := P0 + step_30m
 
 // Step 2: +45m (chained from +30m)
 float tod_45m  = f_todVolMult(t45m_step)
 float sv_45m   = hrlyVol * tod_45m * volClusterMult
-float step_45m = sv_45m * 0.50 * (f_sessEffBias(s45m_st, bias45m) + macroContrib * 0.5 + attractorPull) + volDragPerHour * 0.25 + dStep2
+float step_45m = sv_45m * 0.25 * (f_sessEffBias(s45m_st, bias45m) + macroContrib * 0.5 + attractorPull) + volDragPerHour * 0.25 + dStep2
 float spx_45m  = spx_30m + step_45m
 
 // Step 3: +1H (chained from +45m)
 float tod_1H   = f_todVolMult(t1H_step)
 float sv_1H    = hrlyVol * tod_1H * volClusterMult
-float step_1H  = sv_1H * 0.50 * (f_sessEffBias(s1_st, bias1H) + macroContrib * 0.5 + attractorPull) + volDragPerHour * 0.25 + dStep3
+float step_1H  = sv_1H * 0.25 * (f_sessEffBias(s1_st, bias1H) + macroContrib * 0.5 + attractorPull) + volDragPerHour * 0.25 + dStep3
 float spx_1H   = spx_45m + step_1H
 
 // Step 4: +2H (chained from +1H)
@@ -2562,9 +2741,38 @@ float chgPost = postMktVol * (f_sessEffBias("POST-MKT", biasEOD) + macroAdj * 0.
 float chgOvn  = overnightVol * (f_sessEffBias("OVERNIGHT", biasEOD) + macroAdj * 0.35 + attractorPull) + dragOvn + forecastDrift * 0.15
 float chgPre  = preMktVol * (f_sessEffBias("PRE-MKT", biasEOD) + macroAdj * 0.65 + attractorPull) + dragPre + forecastDrift * 0.10
 
+// ─── Empirical Opening-Gap Distribution (moved up from the position-sizing block further down so
+// expectedGap right below — the "Explicit SOXL Opening Gap Model" — can consume the SAME real,
+// instrument-specific gap data the sizing engine already tracks, instead of an unrelated generic
+// hrlyVol*1.25 heuristic — Issue #23). gapHistDollar tracks the last 60 sessions' actual opening gap
+// magnitude (|open - prior close|, $ terms).
+var array<float> gapHistDollar = array.new<float>(60, 0.0)
+var int gapHistIdx   = 0
+var int gapHistCount = 0
+if isNewDay
+    float gapAbs = not na(close[1]) and close[1] > 0 ? math.abs(open - close[1]) : 0.0
+    array.set(gapHistDollar, gapHistIdx, gapAbs)
+    gapHistIdx   := (gapHistIdx + 1) % 60
+    gapHistCount := math.min(60, gapHistCount + 1)
+
+// Issue #24: percentile computed over only the genuinely populated prefix while warming up, not the full
+// zero-padded 60-slot buffer — previously this returned exactly 0 for the entire first ~57 sessions (the
+// 95th-percentile rank keeps landing on a zero-filled placeholder as long as >=4 of 60 slots still are),
+// not "gradually becomes meaningful" as originally intended. Once gapHistCount reaches 60 every slot is a
+// genuine observation (the circular buffer only overwrites the oldest real one from then on), so the slice
+// is only needed during warmup.
+f_gapPercentile(int pct) =>
+    gapHistCount <= 0 ? 0.0 : array.percentile_nearest_rank(gapHistCount < 60 ? array.slice(gapHistDollar, 0, gapHistCount) : gapHistDollar, pct)
+
 // Explicit SOXL Opening Gap Model (Pre-Market -> Next Day Open)
 float gapDirectionMult = biasPreMkt * 0.6 + basketFactorSum * 0.4
-float expectedGap      = hrlyVol * 1.25 * gapDirectionMult * vixRegimeScale
+// Issue #23: magnitude sourced from gapHistDollar's own empirical median gap once enough real sessions
+// exist (gapHistCount >= 20, roughly a trading month — a reasonable floor for a median to mean anything),
+// instead of the unrelated hrlyVol*1.25 heuristic; falls back to that heuristic during cold start.
+// vixRegimeScale still scales for the current vol regime the same way it always did.
+float gapMagEmpirical = f_gapPercentile(50)
+float expectedGapMag  = gapHistCount >= 20 and gapMagEmpirical > 0 ? gapMagEmpirical : hrlyVol * 1.25
+float expectedGap      = expectedGapMag * gapDirectionMult * vixRegimeScale
 
 // ─── Adaptive Next-Day Factor Weighting, continued ───
 // barsPerDayNd/retSinceYest/corrT1DNd/corrT4HNd are reused from biasEOD_trend's weighting above, but with
@@ -2647,6 +2855,23 @@ else if nowSess == "POST-MKT"
 
 float nextDayChg = pxNextDay - P0
 
+// Issue #19: cross-check between the hourly ladder (spx_30m..spx_6H, driven by bias30m..bias6H) and the
+// session chain (pxEOD, driven by biasEOD) — two independently-formulated forecast pathways that can both
+// be estimating price at a similar point in time (e.g. mid-afternoon, ~4-6h left in the session) via
+// completely different formulas/weights/inputs, with nothing previously reconciling them. Only meaningful
+// while nowSess=="MARKET", where pxEOD is P0-anchored over the SAME remaining-hours-today horizon the
+// ladder's own rungs are P0-anchored over (in other nowSess branches pxEOD chains through multiple
+// upstream sessions first and isn't directly comparable this way). Picks whichever ladder rung's
+// cumulative horizon is closest to remainHoursReg and flags a genuine divergence (opposite-signed, beyond
+// the same ATR-scaled noise floor used elsewhere) — diagnostic only, mirroring the Session Alignment
+// Engine's own sessionDivergent flag just below, not wired into any trading decision.
+float ladderNearestReg = remainHoursReg <= 1.5 ? spx_1H : remainHoursReg <= 2.5 ? spx_2H : remainHoursReg <= 3.5 ? spx_3H : remainHoursReg <= 4.5 ? spx_4H : remainHoursReg <= 5.5 ? spx_5H : spx_6H
+float ladderRegRet = P0 > 0 ? (ladderNearestReg - P0) / P0 * 100.0 : 0.0
+float pxEODRet     = P0 > 0 ? (pxEOD - P0) / P0 * 100.0 : 0.0
+float regDivergeNoiseFloorPct = P0 > 0 ? (atr * 0.10) / P0 * 100.0 : 0.05
+bool ladderVsChainDivergent = nowSess == "MARKET" and ((ladderRegRet > regDivergeNoiseFloorPct and pxEODRet < -regDivergeNoiseFloorPct) or (ladderRegRet < -regDivergeNoiseFloorPct and pxEODRet > regDivergeNoiseFloorPct))
+plot(ladderVsChainDivergent ? 1.0 : 0.0, title="Ladder vs Session-Chain Divergence (diagnostic)", display=display.data_window)
+
 // ═══════════════════════════════════════════════════════════════════════════
 // BASE-PRICE REFERENCE — how every session forecast's % return is measured
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2718,17 +2943,21 @@ float nextDayChg = pxNextDay - P0
 // against each other, which would be meaningless across legs with different bases.
 float g_regBase = (not na(prevDayC) and prevDayC > 0) ? prevDayC : pxEODAnchor
 
+// Issue #20: horizons passed to f_retToProb below — remainHoursReg (hours left in today's session) for
+// Current Reg, +24h beyond that for Next Reg (tomorrow's close), and the same Pre/Post/Ovn horizon-hour
+// constants (5.5/4.0/8.0) the sigma bands elsewhere in the file already use for these same three sessions —
+// so each leg's calibrated probability draws on accuracy history matching roughly its own timescale.
 float curRegReturn  = g_regBase > 0 ? ((pxEOD - g_regBase) / g_regBase) * 100.0 : 0.0
-float curRegProbUp  = f_retToProb(curRegReturn, atr, directionalWinRate)
+float curRegProbUp  = f_retToProb(curRegReturn, atr, directionalWinRate, na, remainHoursReg)
 float nextRegReturn = g_regBase > 0 ? ((pxNextDay - g_regBase) / g_regBase) * 100.0 : 0.0
-float nextRegProbUp = f_retToProb(nextRegReturn, atr, directionalWinRate)
+float nextRegProbUp = f_retToProb(nextRegReturn, atr, directionalWinRate, na, remainHoursReg + 24.0)
 
 float alignPreReturn  = pxEODAnchor > 0 ? ((nz(pxPre, pxEODAnchor)  - pxEODAnchor) / pxEODAnchor) * 100.0 : 0.0
-float alignPreProbUp  = f_retToProb(alignPreReturn, atr, directionalWinRate)
+float alignPreProbUp  = f_retToProb(alignPreReturn, atr, directionalWinRate, na, 5.5)
 float alignPostReturn = pxEODAnchor > 0 ? ((nz(pxPost, pxEODAnchor) - pxEODAnchor) / pxEODAnchor) * 100.0 : 0.0
-float alignPostProbUp = f_retToProb(alignPostReturn, atr, directionalWinRate)
+float alignPostProbUp = f_retToProb(alignPostReturn, atr, directionalWinRate, na, 4.0)
 float alignOvnReturn  = pxEODAnchor > 0 ? ((nz(pxOvn, pxEODAnchor)  - pxEODAnchor) / pxEODAnchor) * 100.0 : 0.0
-float alignOvnProbUp  = f_retToProb(alignOvnReturn, atr, directionalWinRate)
+float alignOvnProbUp  = f_retToProb(alignOvnReturn, atr, directionalWinRate, na, 8.0)
 
 // ATR-scaled noise floor expressed as a %, matching f_renderForecastRow's own noiseFloor principle (never
 // a fixed $/% value), so direction classification stays consistent regardless of price level.
@@ -2786,11 +3015,12 @@ string sessionDecision = sessionPrimaryBull ? (secondaryBullCount >= 2 ? "LONG B
      sessionDivergent ? "WAIT (Reg Divergence)" :
      "NEUTRAL/MIXED"
 
-// Asymmetric EOD model volatility band for Next Day Close (see P1-21 note above f_renderSessionOutlookRows'
-// skew computation — the asymmetric skew here means this is a bias-shaped range, not a formal 68% CI).
-float nextDaySkew = 1.0 + C_SKEW_COEF * math.max(-1.0, math.min(1.0, tomRegBias))
-float nextDayHi   = pxNextDay + (dailyRange * 0.5 * volClusterMult * nextDaySkew)
-float nextDayLo   = math.max(0.01, pxNextDay - (dailyRange * 0.5 * volClusterMult / nextDaySkew))
+// Issue #3: symmetric band — pxNextDay is already shifted in the tomRegBias direction upstream (chained
+// through chgNextDayReg etc.), so skewing the band by the SAME tomRegBias signal again double-counted it.
+// See f_renderForecastRow's identical fix/comment above for the full rationale.
+float nextDaySigma = dailyRange * 0.5 * volClusterMult
+float nextDayHi    = pxNextDay + nextDaySigma
+float nextDayLo    = math.max(0.01, pxNextDay - nextDaySigma)
 
 // EOD Forecast Accuracy & Return-Probability Calibration Bin Updates. Fires on the regular session's close
 // (not calendar midnight, which could land on a pre-market bar) and validates a forecast FROZEN at that
@@ -2983,24 +3213,17 @@ float riskDist = isBearBias ? riskDistShort : riskDistLong
 
 // P0: gap/event-risk-adjusted sizing (#34) — riskDollars/riskDist alone assumes the position can always
 // exit AT the stop; SOXL (3x leveraged) can gap straight through it overnight on macro/semiconductor news,
-// realizing a materially larger loss than the nominal stop distance implies. gapHistDollar tracks the last
-// 60 sessions' actual opening gap magnitude (|open - prior close|, $ terms) so gapRiskP95 reflects this
-// INSTRUMENT's own realized gap behavior rather than a generic assumption — it starts near 0 and only
-// becomes meaningful once real sessions have populated most of the 60 slots (conservative: during warmup
-// this term just contributes nothing, falling back to whichever of the other two is larger, never zeroing
-// out sizing). effectiveRiskDist — used ONLY for SIZING below (kellyTargetPosSize/rawPosSize), never for
-// where slPx/tp*Px actually get placed, which stay anchored to the structural riskDist — is whichever of
-// the nominal stop distance, the 95th-percentile historical gap, or a stress-scaled distance
-// (eventVolMultiplier, already computed in §9b from FOMC/CPI/earnings flags + auto-detected macro/vol
-// spikes) is largest, so a realistic worst-case fill shrinks the position size even when the nominal
-// ATR-based stop distance alone looks tight.
-var array<float> gapHistDollar = array.new<float>(60, 0.0)
-var int gapHistIdx = 0
-if isNewDay
-    float gapAbs = not na(close[1]) and close[1] > 0 ? math.abs(open - close[1]) : 0.0
-    array.set(gapHistDollar, gapHistIdx, gapAbs)
-    gapHistIdx := (gapHistIdx + 1) % 60
-float gapRiskP95 = array.percentile_nearest_rank(gapHistDollar, 95)
+// realizing a materially larger loss than the nominal stop distance implies. gapHistDollar/gapHistCount/
+// f_gapPercentile (declared earlier alongside expectedGap — Issue #23 — so both consume the same empirical
+// gap data) give gapRiskP95 this INSTRUMENT's own realized gap behavior rather than a generic assumption,
+// and now become meaningful from the first few real sessions rather than staying inert for ~57 (Issue #24).
+// effectiveRiskDist — used ONLY for SIZING below (kellyTargetPosSize/rawPosSize), never for where slPx/
+// tp*Px actually get placed, which stay anchored to the structural riskDist — is whichever of the nominal
+// stop distance, the 95th-percentile historical gap, or a stress-scaled distance (eventVolMultiplier,
+// already computed in §9b from FOMC/CPI/earnings flags + auto-detected macro/vol spikes) is largest, so a
+// realistic worst-case fill shrinks the position size even when the nominal ATR-based stop distance alone
+// looks tight.
+float gapRiskP95 = f_gapPercentile(95)
 float eventStressRiskDist = riskDist * eventVolMultiplier
 float effectiveRiskDist = math.max(riskDist, math.max(gapRiskP95, eventStressRiskDist))
 
@@ -3055,23 +3278,41 @@ float blendedTargetRR = i_tp1R * 0.50 + i_tp2R * 0.30 + i_tp3R * 0.20
 float rollAvgWinR     = rollCountWin > 0 ? rollSumWinR / rollCountWin : blendedTargetRR
 float rollAvgLossR    = rollCountLoss > 0 ? rollSumLossR / rollCountLoss : 1.0
 float rollAvgWinLoss  = rollAvgLossR > 0 ? rollAvgWinR / rollAvgLossR : blendedTargetRR
-// P0: replaced the textbook binary-outcome Kelly (win-rate + win/loss RATIO) with the general-distribution
-// formula f*=E[R]/E[R^2], computed directly from the ACTUAL realized R-multiple distribution (histOutcome)
-// via rollSumR/rollSumRSq above — the binary formula assumes every trade is either a fixed win of size b
-// or a fixed loss of 1, which this strategy's partial exits/trailing stops/variable holding periods/gap
-// fills don't produce; collapsing the real, variable-sized R-multiples into "win-rate + one ratio" discards
-// exactly the distribution shape Kelly needs. f*=E[R]/E[R^2] is the growth-optimal fraction for ANY
-// per-trade return distribution sized as a fraction of capital, not just a binary one. rollMeanRLCB (a
-// lower-confidence-bound: the mean minus one standard error) shrinks the numerator toward zero when the
-// sample doesn't yet clearly separate from zero, instead of trusting a noisy small-N mean at full
-// strength — a practical guard against Kelly overbetting on an estimate that's still mostly noise.
-float rollMeanR    = activeLenK > 0 ? rollSumR / activeLenK : 0.0
-float rollMeanRSq  = activeLenK > 0 ? rollSumRSq / activeLenK : 0.0
-float rollVarR     = activeLenK > 1 ? math.max(0.0, rollMeanRSq - rollMeanR * rollMeanR) : 0.0
-float rollSeR      = activeLenK > 1 ? math.sqrt(rollVarR / activeLenK) : math.abs(rollMeanR)
-float rollMeanRLCB = math.max(0.0, rollMeanR - rollSeR)
-float kellyFValRaw = activeLenK >= 5 and rollMeanRSq > 0 ? rollMeanRLCB / rollMeanRSq : 0.0
-float kellyFVal    = math.max(0.0, math.min(1.0, kellyFValRaw)) * math.max(0.05, math.min(1.0, i_kellyFract))
+// Issue #25: f*=E[R]/E[R^2] (the prior formula here) is only the closed-form maximizer of the SECOND-ORDER
+// Taylor expansion of the true log-growth objective E[ln(1+f*R)] around f=0 — a small-f, light-tail
+// approximation that under-penalizes large losses relative to true log utility, and so systematically
+// overstates the safe bet size once the realized R-distribution develops fat left tails (e.g. a stop
+// gapped through, producing an R far more negative than a "clean" -1R) — exactly the tail risk this
+// script's own gap-risk sizing (gapHistDollar/gapRiskP95 above) already flags as a real SOXL-specific
+// concern. kellyFExact instead numerically maximizes the EXACT log-growth objective via a small grid
+// search directly over the empirical R-multiple sample (histOutcome), the standard way to solve for
+// log-optimal f when the outcome distribution isn't a simple binary win/loss. Gated on a trade-count
+// change (same caching pattern used for wTrend/wLiq/etc above), since a grid search costs far more per
+// evaluation than the old closed form and only needs recomputing when histOutcome actually changes.
+var float kellyFExact = 0.0
+if totalTrades != totalTrades[1] or bar_index == 1
+    float worstLossR = 0.0
+    if activeLenK > 0
+        for k = 0 to activeLenK - 1
+            worstLossR := math.min(worstLossR, array.get(histOutcome, k))
+    // Ruin-avoidance ceiling: f must stay strictly below 1/|worstLossR| so 1+f*R never reaches zero for the
+    // worst observed loss (0.95 safety margin), and never exceeds 100% of allocated risk capital regardless.
+    float fCeil = worstLossR < 0.0 ? math.min(1.0, 0.95 / math.abs(worstLossR)) : 1.0
+    float bestF = 0.0
+    float bestG = 0.0  // g(0) = mean ln(1) = 0 — the no-bet baseline every candidate must beat
+    if activeLenK >= 5 and fCeil > 0.0
+        int gridSteps = 40
+        for gi = 1 to gridSteps
+            float fCand  = fCeil * gi / gridSteps
+            float logSum = 0.0
+            for k = 0 to activeLenK - 1
+                logSum += math.log(math.max(1.0 + fCand * array.get(histOutcome, k), 0.0001))
+            float gMean = logSum / activeLenK
+            if gMean > bestG
+                bestG := gMean
+                bestF := fCand
+    kellyFExact := bestF
+float kellyFVal = math.max(0.0, math.min(1.0, kellyFExact)) * math.max(0.05, math.min(1.0, i_kellyFract))
 // P0: sized off effectiveRiskDist (gap/event-adjusted, see #34 above), not the bare structural riskDist.
 float kellyTargetPosSize = effectiveRiskDist > 0 ? (simEquity * kellyFVal) / effectiveRiskDist : 0.0
 
@@ -3168,8 +3409,15 @@ float rrMinShort = targetFallbackShort ? 3.0 : 2.0
 
 // P0: sessionLongConfirm/sessionShortConfirm (§9b Session Alignment Engine) appended as an ADDITIONAL
 // gate — permanently true (no effect) unless i_useSessionAlign is explicitly enabled.
+// Issue #22: sellSignal now gates on rrAgg (close-based R:R, direction-aware via isBearBias), not rrBo
+// (measured from the hypothetical breakout trigger boEntry). The actual fill in the Entry block below is
+// always entryPx = close * (1 +/- slippage) for BOTH directions — rrBo measured risk/reward over a
+// different, never-actually-transacted price gap (boEntry sits up to atr*0.8 away from close), so the
+// short-side eligibility gate could pass or fail based on a level the strategy never fills at. rrAgg/
+// rrMinShort now mirrors exactly how the long side is already gated. rrBo/boEntry are left computed,
+// unused for gating, in case a genuine stop/breakout-order feature is added later.
 bool buySignal  = confirmed and _isUsMkt and effectiveTrend == 1 and sComposite >= minScore and (setupGrade == "A+" or setupGrade == "A" or setupGrade == "B") and executionOk and posSize > 0 and rrAgg >= rrMinLong and not isOverextendedLong and not badTiming and sessionLongConfirm
-bool sellSignal = confirmed and _isUsMkt and canShort and effectiveTrend == -1 and bearConf >= bearMinScore and (shortGrade == "A+" or shortGrade == "A" or shortGrade == "B") and executionOk and posSize > 0 and rrBo >= rrMinShort and not isOverextendedShort and not badTiming and sessionShortConfirm
+bool sellSignal = confirmed and _isUsMkt and canShort and effectiveTrend == -1 and bearConf >= bearMinScore and (shortGrade == "A+" or shortGrade == "A" or shortGrade == "B") and executionOk and posSize > 0 and rrAgg >= rrMinShort and not isOverextendedShort and not badTiming and sessionShortConfirm
 
 // P1-18: dynamic slippage multiplier — a fixed 5bps/side is a baseline assumption, not an execution model.
 // Real slippage scales with liquidity (thin volume -> wider effective spread), volatility regime (VIX,
@@ -3292,6 +3540,12 @@ var float bankedFriction = 0.0
 // only the final tranche's per-share netPnl, so e.g. +0.75R at TP1 + +0.90R at TP2 + -1.00R on the
 // remainder would get globally counted as a LOSS despite the trade being net profitable overall.
 var float bankedDollarPnl = 0.0
+// Issue #8 diagnostic: counts bars where a freshly-tightened trail level was ALREADY breached by that
+// same bar's own low/high — i.e. bars where the deliberate one-bar detection deferral (see the trailing
+// update comment below) meant a real stop-out was only caught starting the NEXT bar, a materially larger
+// unhedged excursion for a 3x leveraged instrument on a sharp reversal bar. Flags the risk without
+// changing behavior — the deferral itself stays as documented and intentional.
+var int trailGapRiskCount = 0
 
 if (buySignal and not inLong) or (sellSignal and not inShort)
     bankedR := 0.0
@@ -3300,7 +3554,14 @@ if (buySignal and not inLong) or (sellSignal and not inShort)
     bankedFriction := 0.0
     bankedDollarPnl := 0.0
 
-if inLong and confirmed
+// Issue #1 (critical): gated with bar_index > entryBar — the SAME invariant canExit already enforces for
+// SL/CHoCH/maxHold exits further down, but this tracking block previously had no such gate. Without it, on
+// the very bar a signal fires (entryBar == bar_index), this block tested THAT SAME bar's high/low against
+// tp1Px/tp2Px/tp3Px (computed from entryPx, itself derived from that same bar's close) — meaning TP1-3
+// could all fire using price action from the bar the position was decided on, before any fill could
+// realistically have happened. That fabricates impossible one-bar round-trip wins, corrupting win rate,
+// PF, expectancy, and every downstream calibration array (histOutcome, calGrade*) that reads tradeR.
+if inLong and confirmed and bar_index > entryBar
     // P0: track the bar's actual intrabar HIGH, not close — a long that traded $100->$104->closed $101
     // reached a genuine $104 peak; using close alone would silently understate it as $101, pulling the
     // eventual trail = peakPx - atr*i_trailMult level closer to price than the position's real run-up
@@ -3372,11 +3633,14 @@ if inLong and confirmed
         // current bar before the tightened stop can apply, rather than guessing an intrabar order.
         if tp1Hit
             float trail = peakPx - atr * i_trailMult
+            // Issue #8 diagnostic — see trailGapRiskCount's declaration comment.
+            if low <= trail
+                trailGapRiskCount += 1
             if trail > slPx
                 slPx    := trail
                 slState := "TRAILING"
 
-else if inShort and confirmed
+else if inShort and confirmed and bar_index > entryBar
     // P0: short-side mirror of the long-side note above — tracks the bar's actual intrabar LOW, not close.
     peakPx := math.min(nz(peakPx, close), low)
 
@@ -3424,6 +3688,9 @@ else if inShort and confirmed
         // Short-side mirror of the long-side trailing note above — same deliberate next-bar-only check.
         if tp1Hit
             float trail = peakPx + atr * i_trailMult
+            // Issue #8 diagnostic — see trailGapRiskCount's declaration comment.
+            if high >= trail
+                trailGapRiskCount += 1
             if trail < slPx
                 slPx    := trail
                 slState := "TRAILING"
@@ -3438,8 +3705,11 @@ else if inShort and confirmed
 // the SAME finalization (state reset, rolling-array recording, win/loss tally) to run on the exact bar
 // remFrac reaches zero — remShares further down naturally evaluates to 0 in that case, so fill/friction
 // values are irrelevant (multiplied by zero) and total P&L is exactly what TP1-3 already banked.
-bool longTpExhausted  = inLong  and remFrac <= 0.0
-bool shortTpExhausted = inShort and remFrac <= 0.0
+// Issue #1: bar_index > entryBar included here too, defense-in-depth alongside the tracking-block gate
+// above — remFrac can no longer actually change on the entry bar now, so this is redundant today, but
+// keeps this specific invariant self-documented and safe against a future edit reintroducing the gap.
+bool longTpExhausted  = inLong  and remFrac <= 0.0 and bar_index > entryBar
+bool shortTpExhausted = inShort and remFrac <= 0.0 and bar_index > entryBar
 
 // P0: dailyMtmHalted forces a full exit when the OPEN position's live mark-to-market loss alone (not just
 // already-REALIZED dailyPnL from past exits) breaches the daily loss limit. dailyLossHalted/executionOk
@@ -3523,11 +3793,18 @@ if longFullExit or shortFullExit
     array.set(histBarsHeld, histIdx, bar_index - entryBar)
     histIdx := (histIdx + 1) % i_rollWin
 
-    // Fix 4 & 7: Update Long or Short calibration bins with Laplace smoothing
+    // Issue #7: win/loss classification below now uses totalTradePnl (the canonical, actual-dollar
+    // sign-of-truth also used for wins/losses/grossWin/grossLoss further down), not tradeR > 0. tradeR is
+    // a SEPARATE computation (bankedR from the static i_tpXR inputs + remGrossR from entryRisk, which can
+    // fall back to a stale/trailed value — see Issue #9) that can disagree in sign with the trade's actual
+    // realized dollar P&L at the margin, which previously let this calibration bin/grade bookkeeping
+    // silently classify a trade as a "win" or "loss" opposite to how it was actually counted in the
+    // headline win rate/PF/expectancy stats. tradeR itself is unchanged as the stored MAGNITUDE (histOutcome,
+    // calGradeSumR/SumRSq) — only the binary win/loss threshold is unified.
     int calBin = math.min(4, math.floor(openTradeProb / 20.0))
     if isExitLong
         array.set(calBinTotalLong, calBin, array.get(calBinTotalLong, calBin) + 1.0)
-        if tradeR > 0
+        if totalTradePnl >= 0
             array.set(calBinWinsLong, calBin, array.get(calBinWinsLong, calBin) + 1.0)
         float _cbNL = array.get(calBinTotalLong, calBin)
         float _cbWL = array.get(calBinWinsLong, calBin)
@@ -3535,7 +3812,7 @@ if longFullExit or shortFullExit
         array.set(calBinEmpPLong, calBin, laplacePL)
     else
         array.set(calBinTotalShort, calBin, array.get(calBinTotalShort, calBin) + 1.0)
-        if tradeR > 0
+        if totalTradePnl >= 0
             array.set(calBinWinsShort, calBin, array.get(calBinWinsShort, calBin) + 1.0)
         float _cbNS = array.get(calBinTotalShort, calBin)
         float _cbWS = array.get(calBinWinsShort, calBin)
@@ -3563,7 +3840,8 @@ if longFullExit or shortFullExit
         // standard error on Expected R (variance = E[R^2] - E[R]^2) instead of just showing a point estimate
         // with no sense of how much sampling noise it carries. See the SCORE row footnote in §12.
         array.set(calGradeSumRSq, gIdx, array.get(calGradeSumRSq, gIdx) + tradeR * tradeR)
-        if tradeR > 0
+        // Issue #7: totalTradePnl, not tradeR > 0 — see the comment at the calBin block above.
+        if totalTradePnl >= 0
             array.set(calGradeWins, gIdx, array.get(calGradeWins, gIdx) + 1.0)
         float _gN = array.get(calGradeTotal, gIdx)
         float _gW = array.get(calGradeWins, gIdx)
@@ -3677,6 +3955,8 @@ plot(isExpert ? nextTfLo : na, "Expected Min", color=color.new(#FF1744, 50), sty
 // drifted from an independent same-horizon estimate.
 plot(spx_1H_indep, "1H Forecast (Independent)", display=display.data_window)
 plot(spx_4H_indep, "4H Forecast (Independent)", display=display.data_window)
+// Issue #8 diagnostic — see trailGapRiskCount's declaration comment near the position-tracking block.
+plot(trailGapRiskCount, "Trail-Gap Risk Count (diagnostic)", display=display.data_window)
 
 // Opening Range Levels (ORB 15m / 30m)
 bool showRealizedOrb = _isUsMkt and (orbComplete or inOrbWindow)
@@ -3719,6 +3999,18 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
     // completion and shows the NEXT occurrence instead — chained one full cycle further (through the
     // remaining legs of the session order Pre->Reg->Post->Ovn->Pre) — per explicit dashboard requirement.
     // The other three rows already land on "next" naturally via the existing nowSess chain in §9b.
+    // Issue #6: this chains four legs by summing $ DELTAS off a fixed base, not by compounding each leg's
+    // %-return off the PRIOR leg's resulting price — a fine approximation for small moves, but one that
+    // drifts from the (more correct) multiplicative chain as the sum of the legs' magnitude grows, since
+    // each chgX here is sized off the ORIGINAL anchor's price level rather than the compounding one.
+    // Concretely: additive error vs. true multiplicative compounding is second-order, approximately
+    // Sum(chgX)^2 / (2*price) in the worst case all-same-sign — negligible for a single-digit-% total move,
+    // but growing faster than linearly if several legs compound the same direction during a high-volatility
+    // stretch (exactly when a 3x leveraged instrument like SOXL is most likely to see back-to-back large
+    // moves). A full multiplicative rewrite here would need to reformulate every chgX upstream (§9b) as a
+    // %-return chained off its own leg's resulting price, touching the Session Alignment Engine and the
+    // EOD/Platt calibration tracking that reads these same values — flagged as a real, bounded limitation
+    // rather than attempted as a large, hard-to-verify rewrite in this pass.
     float pxPreDisplay = pxPre
     string datePreMktDisplay = datePreMkt
     if nowSess == "PRE-MKT"
@@ -3745,34 +4037,43 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
     float sigmaPost  = postMktVol * math.sqrt(4.0) * volClusterMult * errorScale
     float sigmaOvn   = overnightVol * math.sqrt(8.0) * volClusterMult * errorScale
 
-    float preSkew  = 1.0 + C_SKEW_COEF * biasPreMkt
-    float pre68Lo  = math.max(0.01, pxPreDisplay - (sigmaPre / preSkew))
-    float pre68Hi  = pxPreDisplay + (sigmaPre * preSkew)
+    // Issue #3: symmetric bands — pxPreDisplay/pxEOD/pxPostDisplay/pxOvn are each already shifted in their
+    // own bias direction upstream (chgPre/biasEOD's own chain/chgPost/chgOvn), so re-applying that SAME
+    // bias to asymmetrically skew the band around it double-counted the signal (once on location, again
+    // on shape), mechanically producing an overconfident one-sided-looking range. See f_renderForecastRow's
+    // identical fix/comment above for the full rationale.
+    float pre68Lo  = math.max(0.01, pxPreDisplay - sigmaPre)
+    float pre68Hi  = pxPreDisplay + sigmaPre
 
-    float eodSkew  = 1.0 + C_SKEW_COEF * biasEOD
-    float eod68Lo  = math.max(0.01, pxEOD - (sigmaEod / eodSkew))
-    float eod68Hi  = pxEOD + (sigmaEod * eodSkew)
+    float eod68Lo  = math.max(0.01, pxEOD - sigmaEod)
+    float eod68Hi  = pxEOD + sigmaEod
 
-    float postSkew = 1.0 + C_SKEW_COEF * biasPostMkt
-    float post68Lo = math.max(0.01, pxPostDisplay - (sigmaPost / postSkew))
-    float post68Hi = pxPostDisplay + (sigmaPost * postSkew)
+    float post68Lo = math.max(0.01, pxPostDisplay - sigmaPost)
+    float post68Hi = pxPostDisplay + sigmaPost
 
-    float ovnSkew  = 1.0 + C_SKEW_COEF * biasOvn
-    float ovn68Lo  = math.max(0.01, pxOvn - (sigmaOvn / ovnSkew))
-    float ovn68Hi  = pxOvn + (sigmaOvn * ovnSkew)
+    float ovn68Lo  = math.max(0.01, pxOvn - sigmaOvn)
+    float ovn68Hi  = pxOvn + sigmaOvn
 
     // Row: Pre-Market Outlook (1:30 PM IST). Base is always the CURRENT live price (safeAnchor); the
     // target is pxPreDisplay — "today's own" pre-market unless we're already inside it, in which case
     // it's the NEXT one (see pxPreDisplay above).
     float expRetPre = safeAnchor > 0 ? ((nz(pxPreDisplay, safeAnchor) - safeAnchor) / safeAnchor) * 100.0 : 0.0
-    float probUpPre = f_retToProb(expRetPre, atr, directionalWinRate)
+    // Issue #20: horizon-hours matched to this row's own sigmaPre/Eod/Post/Ovn constants just above.
+    float probUpPre = f_retToProb(expRetPre, atr, directionalWinRate, na, 5.5)
     color preClr = (pxPreDisplay >= safeAnchor + atr * 0.05) ? #00E676 : ((pxPreDisplay <= safeAnchor - atr * 0.05) ? #FF1744 : #9E9E9E)
     string preIcon = (pxPreDisplay >= safeAnchor + atr * 0.05) ? "📈" : ((pxPreDisplay <= safeAnchor - atr * 0.05) ? "📉" : "--")
     // P0-3: (Emp:Y%,N=Z) makes explicit how much of probUpPre is validated empirical frequency vs. still
     // the tanh-transform prior — same transparency the NxtDay row already had, now consistent everywhere.
     [preEmpBlend, preEmpN] = f_retProbEmpWeight()
-    string preProbStr = math.abs(expRetPre) < 0.10 ? "50.0%↔" : (expRetPre >= 0 ? (str.tostring(probUpPre, "#.0") + "%↑") : (str.tostring(100.0 - probUpPre, "#.0") + "%↓")) + " (Emp:" + str.tostring(preEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(preEmpN, "0") + ")"
-    string preTxt = datePreMktDisplay + " " + preIcon + " $" + str.tostring(pxPreDisplay, "#.02") + " [$" + str.tostring(pre68Lo, "#.01") + "-" + str.tostring(pre68Hi, "#.01") + "] (" + (expRetPre >= 0 ? "+" : "") + str.tostring(expRetPre, "#.02") + "%) " + preProbStr
+    // Issue #4: "GEmp"/"N=" here is plattBlend/plattN from f_retProbEmpWeight() — a single GLOBAL Platt
+    // calibration sample pooled across every horizon (30m through NextDay alike), not a Pre-specific
+    // count. Labeled "GEmp" (not "Emp") on every row using this so it can't be read as "how many
+    // historical Pre-market forecasts have been validated" — genuine per-horizon calibration tracking
+    // would need separate Platt fits per horizon (same scope as the Platt-split deferred elsewhere).
+    string preProbStr = math.abs(expRetPre) < 0.10 ? "50.0%↔" : (expRetPre >= 0 ? (str.tostring(probUpPre, "#.0") + "%↑") : (str.tostring(100.0 - probUpPre, "#.0") + "%↓")) + " (GEmp:" + str.tostring(preEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(preEmpN, "0") + ")"
+    // Issue #28: "~$" marks the bracketed range as a bias-shaped band (P1-21), not a formal CI — same
+    // convention applied to every range in this row and the ladder above.
+    string preTxt = datePreMktDisplay + " " + preIcon + " $" + str.tostring(pxPreDisplay, "#.02") + " [~$" + str.tostring(pre68Lo, "#.01") + "-" + str.tostring(pre68Hi, "#.01") + "] (" + (expRetPre >= 0 ? "+" : "") + str.tostring(expRetPre, "#.02") + "%) " + preProbStr
     if isMktClosed
         f_dashCell(tbl, r, "Pre (1:30PM)", preTxt, #9E9E9E, #FFD600, bgAlt1, szTiny)
     else
@@ -3786,15 +4087,15 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
     // right now. pxEOD itself (the actual $ target) is untouched — only this comparison base changed.
     float regBase = (not na(prevDayC) and prevDayC > 0) ? prevDayC : safeAnchor
     float expRetEod = ((pxEOD - regBase) / regBase) * 100.0
-    float probUpEod = f_retToProb(expRetEod, atr, directionalWinRate)
+    float probUpEod = f_retToProb(expRetEod, atr, directionalWinRate, na, 6.5)
     string eodUp = str.tostring(probUpEod, "#.0")
     string eodDn = str.tostring(100.0 - probUpEod, "#.0")
     string eodRet = (expRetEod >= 0 ? "+" : "") + str.tostring(expRetEod, "#.00")
     [eodEmpBlend, eodEmpN] = f_retProbEmpWeight()
-    string eodProbStr = (math.abs(expRetEod) < 0.10 ? "50.0%↔" : (expRetEod >= 0 ? (eodUp + "%↑") : (eodDn + "%↓"))) + " (Emp:" + str.tostring(eodEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(eodEmpN, "0") + ")"
+    string eodProbStr = (math.abs(expRetEod) < 0.10 ? "50.0%↔" : (expRetEod >= 0 ? (eodUp + "%↑") : (eodDn + "%↓"))) + " (GEmp:" + str.tostring(eodEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(eodEmpN, "0") + ")"
     color regClr = (pxEOD >= regBase + atr * 0.05) ? #00E676 : ((pxEOD <= regBase - atr * 0.05) ? #FF1744 : #9E9E9E)
     string regIcon = (pxEOD >= regBase + atr * 0.05) ? "📈" : ((pxEOD <= regBase - atr * 0.05) ? "📉" : "--")
-    string regTxt = dateRegMktDisplay + " " + regIcon + " $" + str.tostring(pxEOD, "#.02") + " [$" + str.tostring(eod68Lo, "#.01") + "-" + str.tostring(eod68Hi, "#.01") + "] (" + eodRet + "%) " + eodProbStr
+    string regTxt = dateRegMktDisplay + " " + regIcon + " $" + str.tostring(pxEOD, "#.02") + " [~$" + str.tostring(eod68Lo, "#.01") + "-" + str.tostring(eod68Hi, "#.01") + "] (" + eodRet + "%) " + eodProbStr
     if isMktClosed
         f_dashCell(tbl, r, "Reg (7:00PM)", regTxt, #9E9E9E, #FFD600, bgAlt2, szTiny)
     else
@@ -3805,12 +4106,12 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
     // target is pxPostDisplay — "today's own" post-market unless we're already inside it, in which case
     // it's the NEXT one (see pxPostDisplay above).
     float expRetPost = safeAnchor > 0 ? ((nz(pxPostDisplay, safeAnchor) - safeAnchor) / safeAnchor) * 100.0 : 0.0
-    float probUpPost = f_retToProb(expRetPost, atr, directionalWinRate)
+    float probUpPost = f_retToProb(expRetPost, atr, directionalWinRate, na, 4.0)
     color postClr = (pxPostDisplay >= safeAnchor + atr * 0.05) ? #00E676 : ((pxPostDisplay <= safeAnchor - atr * 0.05) ? #FF1744 : #9E9E9E)
     string postIcon = (pxPostDisplay >= safeAnchor + atr * 0.05) ? "📈" : ((pxPostDisplay <= safeAnchor - atr * 0.05) ? "📉" : "--")
     [postEmpBlend, postEmpN] = f_retProbEmpWeight()
-    string postProbStr = (math.abs(expRetPost) < 0.10 ? "50.0%↔" : (expRetPost >= 0 ? (str.tostring(probUpPost, "#.0") + "%↑") : (str.tostring(100.0 - probUpPost, "#.0") + "%↓"))) + " (Emp:" + str.tostring(postEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(postEmpN, "0") + ")"
-    string postTxt = datePostMktDisplay + " " + postIcon + " $" + str.tostring(pxPostDisplay, "#.02") + " [$" + str.tostring(post68Lo, "#.01") + "-" + str.tostring(post68Hi, "#.01") + "] (" + (expRetPost >= 0 ? "+" : "") + str.tostring(expRetPost, "#.02") + "%) " + postProbStr
+    string postProbStr = (math.abs(expRetPost) < 0.10 ? "50.0%↔" : (expRetPost >= 0 ? (str.tostring(probUpPost, "#.0") + "%↑") : (str.tostring(100.0 - probUpPost, "#.0") + "%↓"))) + " (GEmp:" + str.tostring(postEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(postEmpN, "0") + ")"
+    string postTxt = datePostMktDisplay + " " + postIcon + " $" + str.tostring(pxPostDisplay, "#.02") + " [~$" + str.tostring(post68Lo, "#.01") + "-" + str.tostring(post68Hi, "#.01") + "] (" + (expRetPost >= 0 ? "+" : "") + str.tostring(expRetPost, "#.02") + "%) " + postProbStr
     if isMktClosed
         f_dashCell(tbl, r, "Post (1:30AM)", postTxt, #9E9E9E, #FFD600, bgAlt1, szTiny)
     else
@@ -3823,12 +4124,12 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
     // dashboard requirement. (regBase is defined earlier above, in the Regular Market Outlook row.)
     float ovnBaseAnchor = nowSess == "OVERNIGHT" ? regBase : safeAnchor
     float expRetOvn = ovnBaseAnchor > 0 ? ((nz(pxOvn, ovnBaseAnchor) - ovnBaseAnchor) / ovnBaseAnchor) * 100.0 : 0.0
-    float probUpOvn = f_retToProb(expRetOvn, atr, directionalWinRate)
+    float probUpOvn = f_retToProb(expRetOvn, atr, directionalWinRate, na, 8.0)
     color ovnClr = (pxOvn >= ovnBaseAnchor + atr * 0.05) ? #00E676 : ((pxOvn <= ovnBaseAnchor - atr * 0.05) ? #FF1744 : #9E9E9E)
     string ovnIcon = (pxOvn >= ovnBaseAnchor + atr * 0.05) ? "📈" : ((pxOvn <= ovnBaseAnchor - atr * 0.05) ? "📉" : "--")
     [ovnEmpBlend, ovnEmpN] = f_retProbEmpWeight()
-    string ovnProbStr = (math.abs(expRetOvn) < 0.10 ? "50.0%↔" : (expRetOvn >= 0 ? (str.tostring(probUpOvn, "#.0") + "%↑") : (str.tostring(100.0 - probUpOvn, "#.0") + "%↓"))) + " (Emp:" + str.tostring(ovnEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(ovnEmpN, "0") + ")"
-    string ovnTxt = dateOvnMktDisplay + " " + ovnIcon + " $" + str.tostring(pxOvn, "#.02") + " [$" + str.tostring(ovn68Lo, "#.01") + "-" + str.tostring(ovn68Hi, "#.01") + "] (" + (expRetOvn >= 0 ? "+" : "") + str.tostring(expRetOvn, "#.02") + "%) " + ovnProbStr
+    string ovnProbStr = (math.abs(expRetOvn) < 0.10 ? "50.0%↔" : (expRetOvn >= 0 ? (str.tostring(probUpOvn, "#.0") + "%↑") : (str.tostring(100.0 - probUpOvn, "#.0") + "%↓"))) + " (GEmp:" + str.tostring(ovnEmpBlend * 100.0, "#.0") + "%,N=" + str.tostring(ovnEmpN, "0") + ")"
+    string ovnTxt = dateOvnMktDisplay + " " + ovnIcon + " $" + str.tostring(pxOvn, "#.02") + " [~$" + str.tostring(ovn68Lo, "#.01") + "-" + str.tostring(ovn68Hi, "#.01") + "] (" + (expRetOvn >= 0 ? "+" : "") + str.tostring(expRetOvn, "#.02") + "%) " + ovnProbStr
     if isMktClosed
         f_dashCell(tbl, r, "Ovn (5:30AM)", ovnTxt, #9E9E9E, #FFD600, bgAlt2, szTiny)
     else
@@ -3837,7 +4138,7 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
 
     // Row: Next Day Outlook (session close one full cycle beyond Reg)
     float expRetDaily = (nz(nextDayChg, 0.0) / safeAnchor) * 100.0
-    float probUpDaily = f_retToProb(expRetDaily, atr, directionalWinRate)
+    float probUpDaily = f_retToProb(expRetDaily, atr, directionalWinRate, na, 24.0)
     string ndUp = str.tostring(probUpDaily, "#.0")
     string ndRet = (expRetDaily >= 0 ? "+" : "") + str.tostring(expRetDaily, "#.00")
     float gapPct = not na(prevDayC) and prevDayC > 0 ? math.abs(close - prevDayC) / prevDayC * 100.0 : 0.0
@@ -3847,9 +4148,11 @@ f_renderSessionOutlookRows(table tbl, int startRow, color bgAlt1, color bgAlt2, 
     // outcome pairs in the relevant return-bin) instead of totalTrades — a completely different, unrelated
     // counter (trade entries/exits) that happened to be sitting nearby and got used as a stand-in.
     [ndEmpBlend, ndEmpN] = f_retProbEmpWeight()
-    string ndProbStr = math.abs(expRetDaily) < 0.10 ? "50.0%↔" : (expRetDaily >= 0 ? (ndUp + "%↑ (N=" + str.tostring(ndEmpN, "0") + ", Emp:" + str.tostring(ndEmpBlend * 100.0, "#.0") + "%)") : (str.tostring(100.0 - probUpDaily, "#.0") + "%↓ (N=" + str.tostring(ndEmpN, "0") + ", Emp:" + str.tostring(ndEmpBlend * 100.0, "#.0") + "%)"))
+    string ndProbStr = math.abs(expRetDaily) < 0.10 ? "50.0%↔" : (expRetDaily >= 0 ? (ndUp + "%↑ (N=" + str.tostring(ndEmpN, "0") + ", GEmp:" + str.tostring(ndEmpBlend * 100.0, "#.0") + "%)") : (str.tostring(100.0 - probUpDaily, "#.0") + "%↓ (N=" + str.tostring(ndEmpN, "0") + ", GEmp:" + str.tostring(ndEmpBlend * 100.0, "#.0") + "%)"))
     string gapStr = " Gap:$" + str.tostring(pxNextDayOpen, "#.02")
-    string ndTxt = dateNxtDay + " " + ndIcon + " $" + str.tostring(pxNextDay, "#.02") + " [$" + str.tostring(nextDayLo, "#.01") + "-" + str.tostring(nextDayHi, "#.01") + "] (" + ndRet + "%)" + gapStr + " " + ndProbStr + (catalystDetected ? " ⚠️" : "")
+    // Part D: "~$" for consistency with Pre/Reg/Post/Ovn — this range is built the same bias-shaped-band
+    // way (Issue #28's convention), so omitting the tilde here falsely implied a harder number.
+    string ndTxt = dateNxtDay + " " + ndIcon + " $" + str.tostring(pxNextDay, "#.02") + " [~$" + str.tostring(nextDayLo, "#.01") + "-" + str.tostring(nextDayHi, "#.01") + "] (" + ndRet + "%)" + gapStr + " " + ndProbStr + (catalystDetected ? " ⚠️" : "")
     f_dashCell(tbl, r, "NxtDay", ndTxt, #9E9E9E, isMktClosed ? #FFD600 : (catalystDetected ? #FFD600 : (expRetDaily >= 0.10 ? #00E676 : (expRetDaily <= -0.10 ? #FF1744 : #9E9E9E))), bgAlt1, szTiny)
     r += 1
     r
@@ -4046,7 +4349,7 @@ if i_showDash and barstate.islast
 
     // Next Day Outlook
     float expRetDaily = (nz(nextDayChg, 0.0) / safeAnchor) * 100.0
-    float probUpDaily = f_retToProb(expRetDaily, atr, directionalWinRate)
+    float probUpDaily = f_retToProb(expRetDaily, atr, directionalWinRate, na, 24.0)
     float probDnDaily = 100.0 - probUpDaily
     string ndUp = str.tostring(probUpDaily, "#.0")
     string ndDn = str.tostring(probDnDaily, "#.0")
@@ -4128,7 +4431,10 @@ if i_showDash and barstate.islast
     // proper small-sample t-test — reads as optimistic (narrower than reality) at low N, which is why
     // the SE term itself is only shown once N>=5, and even then should be read cautiously at low N.
     float _gSumRSqForScore = _gIdxScore >= 0 ? array.get(calGradeSumRSq, _gIdxScore) : 0.0
-    float _gVarForScore   = _empNForScore > 1.0 ? math.max(0.0, _gSumRSqForScore / _empNForScore - _expRForScore * _expRForScore) : 0.0
+    // Issue #10: Bessel-corrected (÷(N-1), not ÷N) sample variance — the population-variance formula
+    // previously here is biased low, compounding the SE's already-disclosed low-N optimism exactly in the
+    // N=5-15 range where this footnote first starts showing ±SE.
+    float _gVarForScore   = _empNForScore > 1.0 ? math.max(0.0, (_gSumRSqForScore - _empNForScore * _expRForScore * _expRForScore) / (_empNForScore - 1.0)) : 0.0
     float _gSEForScore    = _empNForScore > 1.0 ? math.sqrt(_gVarForScore / _empNForScore) : 0.0
     string expRStr        = (_expRForScore >= 0 ? "+" : "") + str.tostring(_expRForScore, "#.02") + (_empNForScore >= 5.0 ? "±" + str.tostring(_gSEForScore, "#.02") : "")
     bool isDivergenceNow  = (sComposite - bearConf > 10.0 and pxEOD < P0 - atr * 0.1) or (bearConf - sComposite > 10.0 and pxEOD > P0 + atr * 0.1)
@@ -4177,8 +4483,21 @@ if i_showDash and barstate.islast
         // ─── Tail-Risk Row: P(next-day move exceeds a leveraged-ETF-relevant threshold) ───
         // SOXL is 3x leveraged, so ±2% moves are routine, not tail events — shown so "68% up" isn't
         // mistaken for "68% chance of a big move."
-        float pUpBig = f_probExceed(expRetDaily, atr, 2.0)
-        float pDnBig = f_probExceed(expRetDaily, atr, -2.0)
+        // Issue #5: f_probExceed's underlying model is a Normal/ATR-scaled tanh transform, which will
+        // systematically understate tail probability for a 3x-leveraged, gap-prone, fat-tailed instrument
+        // — the rest of this file goes out of its way to model gap risk (P1-19), leverage drag, and vol
+        // clustering (volClusterMult), all evidence this isn't a thin-tailed name. A genuine fat-tailed
+        // distribution (empirical quantile or Student-t) isn't implementable here without new tracked
+        // history this script doesn't yet keep (a real, separate undertaking). The cheap, honest partial
+        // fix: widen the vol scale by volClusterMult — the SAME EWMA realized-vol-clustering signal
+        // already trusted to size every sigma band elsewhere in this file — instead of bare atr, so the
+        // tail read at least reflects current clustering conditions rather than a static baseline.
+        float atrTailAdj = atr * volClusterMult
+        // Issue #1: t_hours=24.0 — expRetDaily is a next-day-horizon return, so this now scales the tail
+        // z-score's denominator to that horizon instead of the ATR's own (much shorter) natural reference
+        // horizon, consistent with the fix applied to f_rawProb above.
+        float pUpBig = f_probExceed(expRetDaily, atrTailAdj, 2.0, 24.0)
+        float pDnBig = f_probExceed(expRetDaily, atrTailAdj, -2.0, 24.0)
         string tailTxt = "P(>+2%):" + str.tostring(pUpBig, "#.0") + "% | P(<-2%):" + str.tostring(100.0 - pDnBig, "#.0") + "%"
         f_dashCell(dash, r, "☢TAIL", tailTxt, tG, tW, bgAlt2, szTiny)
         r += 1
@@ -4265,9 +4584,7 @@ if i_showDash and barstate.islast
         string tl1 = f_fmt12h(t1H), string tl2 = f_fmt12h(t2H), string tl3 = f_fmt12h(t3H)
         string tl4 = f_fmt12h(t4H), string tl5 = f_fmt12h(t5H), string tl6 = f_fmt12h(t6H)
 
-        // Weekend detection
-        int nowDow = dayofweek(t0H, "Asia/Kolkata")
-        int liveMins = hour(t0H, "Asia/Kolkata") * 60 + minute(t0H, "Asia/Kolkata")
+        // Weekend/holiday detection
         bool isWeekend = s0 == "CLOSED" or isHolidayToday
 
         // ── Row 16: CURRENT SESSION STATUS ──
@@ -4308,13 +4625,16 @@ if i_showDash and barstate.islast
         r += 1
 
         if isWeekend
-            // Calculate next Monday targetStart (Anchored to 5:30 AM IST Overnight Session Start)
+            // Issue #2: Calculate the next genuine trading-session open (Anchored to 5:30 AM IST Overnight
+            // Session Start) via f_daysToNextTradingSession, which skips weekends AND i_holidayDates —
+            // not just "next Monday" arithmetic, which previously mis-routed a single ordinary weekday
+            // holiday 3+ days into the future instead of to the very next trading session.
             int y = year(timenow, "Asia/Kolkata")
             int m = month(timenow, "Asia/Kolkata")
             int d = dayofmonth(timenow, "Asia/Kolkata")
             int midnightToday = timestamp("Asia/Kolkata", y, m, d, 0, 0, 0)
-            int daysToMonday = nowDow == dayofweek.sunday ? 1 : nowDow == dayofweek.saturday ? 2 : (nowDow == dayofweek.monday and liveMins < 330) ? 0 : (9 - nowDow) % 7
-            int targetStart = midnightToday + daysToMonday * 86400000 + 19800000
+            int daysToNextSession = f_daysToNextTradingSession(timenow)
+            int targetStart = midnightToday + daysToNextSession * 86400000 + 19800000
 
             int t30m_we = targetStart + thirtyMinMs
             int t45m_we = targetStart + fortyFiveMinMs

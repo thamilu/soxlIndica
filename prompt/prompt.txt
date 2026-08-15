@@ -1,0 +1,70 @@
+## Role
+
+Act as a **25+ year institutional trader, quantitative analyst, market-microstructure specialist, and senior Pine Script reviewer**. Review the entire Pine Script as if it were being considered for an institutional trading decision-support system.
+
+## Review Objectives
+
+Analyze the script for:
+
+* **Market logic and trading assumptions**
+* Correct use of price, volume, volatility, trend, momentum, sessions, and benchmarks
+* Repainting, lookahead bias, future-data leakage, and unrealistic assumptions
+* Incorrect session handling, especially pre-market, regular market, after-hours, and next-session calculations
+* Timeframe and `request.security()` correctness
+* Statistical and probabilistic validity
+* Risk/reward and expectation logic
+* Calculation consistency and edge cases
+* Performance, maintainability, and Pine Script best practices
+
+### Expected-Value Analysis
+
+Pay special attention to whether the script produces **approximately expected future values** rather than merely directional signals.
+
+For every important prediction/forecast calculation, determine:
+
+1. What price is being used as the **base/reference price**?
+2. What future period is actually being predicted?
+3. Which historical/current inputs are used?
+4. Whether the calculation estimates a realistic **expected price, expected move, expected high/low, or expected return**.
+5. Whether bullish and bearish expectations are calculated symmetrically.
+6. Whether volatility, ATR, historical returns, trend strength, volume, and market/sector conditions are appropriately incorporated.
+7. Whether the expected value is mathematically and statistically defensible.
+8. Whether the prediction accidentally uses information that would not have been available at prediction time.
+9. Whether probabilities/confidence values are genuinely calibrated or simply derived from arbitrary scores.
+10. Whether the output should be expressed as an **approximate range** rather than a falsely precise single price.
+
+For each major expected-value calculation, explain:
+
+**Current/reference price → inputs → formula → expected move → expected future value → bullish/bearish range → confidence/probability → validity**
+
+## Institutional Review Standard
+
+Do not assume the existing methodology is correct. Challenge every major assumption.
+
+Identify:
+
+* **Critical errors**
+* **High-risk logic errors**
+* **Statistical weaknesses**
+* **Prediction/expectation inaccuracies**
+* **Repainting/lookahead problems**
+* **Session/reference-price mistakes**
+* **False precision**
+* **Missing risk controls**
+* **Performance issues**
+* **Code-quality issues**
+
+For every issue provide:
+
+**Problem → Why it is wrong → Trading impact → Example → Recommended correction**
+
+Finally provide:
+
+1. Overall institutional-quality rating /10
+2. Accuracy of expected-value calculations /10
+3. Reliability of probability/confidence calculations /10
+4. List of calculations that should be redesigned
+5. Priority-ordered correction plan
+6. Recommended architecture for a robust institutional-grade forecasting model
+
+Do **not rewrite the entire script unless necessary**. First identify the exact logic that should change and explain why.
